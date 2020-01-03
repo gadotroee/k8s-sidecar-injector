@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/golang/glog"
@@ -406,18 +407,50 @@ func updateAnnotations(target map[string]string, added map[string]string) (patch
 	return patch
 }
 
+func updateLabels(target map[string]string, added map[string]string) (patch []patchOperation) {
+	for key, value := range added {
+		keyEscaped := strings.Replace(key, "/", "~1", -1)
+
+		if target == nil || target[key] == "" {
+			target = map[string]string{}
+			patch = append(patch, patchOperation{
+				Op:    "add",
+				Path:  "/metadata/labels/" + keyEscaped,
+				Value: value,
+			})
+		} else {
+			patch = append(patch, patchOperation{
+				Op:    "replace",
+				Path:  "/metadata/labels/" + keyEscaped,
+				Value: value,
+			})
+		}
+	}
+	return patch
+}
+
 // create mutation patch for resoures
 func createPatch(pod *corev1.Pod, inj *config.InjectionConfig, annotations map[string]string) ([]byte, error) {
 	var patch []patchOperation
 
+	containerPorts := extractContainerPortsFromPod(*pod)
+	envVar := new(corev1.EnvVar)
+	envVar.Name = "APP_PORTS"
+	envVar.Value = strings.Join(containerPorts, ",")
+
+	//injectionConfig.Environment = append(injectionConfig.Environment, *envVar)
+	var envVarsToInject = make([]corev1.EnvVar, len(inj.Environment)+1)
+	copy(inj.Environment, envVarsToInject)
+	envVarsToInject[len(envVarsToInject)-1] = *envVar
+
 	// first, make sure any injected containers in our config get the EnvVars and VolumeMounts injected
 	// this mutates inj.Containers with our environment vars
-	mutatedInjectedContainers := mergeEnvVars(inj.Environment, inj.Containers)
+	mutatedInjectedContainers := mergeEnvVars(envVarsToInject, inj.Containers)
 	mutatedInjectedContainers = mergeVolumeMounts(inj.VolumeMounts, mutatedInjectedContainers)
 
 	// next, make sure any injected init containers in our config get the EnvVars and VolumeMounts injected
 	// this mutates inj.InitContainers with our environment vars
-	mutatedInjectedInitContainers := mergeEnvVars(inj.Environment, inj.InitContainers)
+	mutatedInjectedInitContainers := mergeEnvVars(envVarsToInject, inj.InitContainers)
 	mutatedInjectedInitContainers = mergeVolumeMounts(inj.VolumeMounts, mutatedInjectedInitContainers)
 
 	// next, patch containers with our injected containers
@@ -436,8 +469,9 @@ func createPatch(pod *corev1.Pod, inj *config.InjectionConfig, annotations map[s
 		patch = append(patch, setServiceAccount(inj.ServiceAccountName, "/spec")...)
 	}
 
-	// last but not least, set annotations
-	patch = append(patch, updateAnnotations(pod.Annotations, annotations)...)
+	// last but not least, set annotations and labels
+	patch = append(patch, updateAnnotations(pod.Annotations, annotations)...)	
+	patch = append(patch, updateLabels(pod.Labels, inj.Labels)...)
 	return json.Marshal(patch)
 }
 
@@ -502,6 +536,16 @@ func (whsvr *WebhookServer) mutate(req *v1beta1.AdmissionRequest) *v1beta1.Admis
 			return &pt
 		}(),
 	}
+}
+
+func extractContainerPortsFromPod(pod corev1.Pod) []string {
+	var ports []string
+	for _, container := range pod.Spec.Containers {
+		for _, containerPort := range container.Ports {
+			ports = append(ports, strconv.Itoa(int(containerPort.ContainerPort)))
+		}
+	}
+	return ports
 }
 
 // MetricsHandler method for webhook server
